@@ -14,172 +14,164 @@ This tells us the #1 priority: **don't lose so much to quantization.**
 
 ---
 
-## What We're Actually Going to Build
+## What We're Building
 
-A single modified `train_gpt.py` with three targeted changes. Not 138 scatter-shot
-experiments — three changes, each validated, then combined.
+A single modified `train_gpt.py` with three targeted changes, each validated
+independently, then combined into a final submission.
 
 ---
 
-## Step 1: Quantization-Aware Training (QAT)
+## Step 1: Add Quantization-Aware Training (QAT)
 
-**The problem:** The model trains in bf16, then gets brutally rounded to int8 at the end.
-Weights that land between quantization levels get randomly shoved to the nearest one.
+**The problem:** The model trains in bf16, then gets brutally rounded to int8 at the
+end. Weights that land between quantization levels get shoved to the nearest one.
 The model never learned to be robust to this.
 
-**What we code:**
+**What we do:**
+
+Add a `fake_quantize` function that simulates int8 quantization during the forward
+pass using a straight-through estimator (STE). The forward pass sees quantized weights,
+but gradients flow through as if the weights were unquantized:
+
 ```python
-# In the forward pass of each Linear layer, after step N:
 def fake_quantize(weight):
     scale = weight.abs().amax(dim=-1, keepdim=True) / 127.0
     w_q = (weight / scale).round().clamp(-127, 127)
-    # Straight-through estimator: forward uses quantized, backward uses original
     return weight + (w_q * scale - weight).detach()
 ```
 
 We activate this in the **last 20% of training** (~last 2 minutes). The model learns
-to arrange its weights so they quantize cleanly.
+to arrange its weights at values that quantize cleanly.
 
-**Where in code:** Wrap the `fc`, `proj`, `qkv`, and `out_proj` weight matrices in
-`CausalSelfAttention` and `MLP` classes. Add a global step counter that flips QAT on.
+**Where in code:** Wrap the weight matrices in `CausalSelfAttention.forward()` and
+`MLP.forward()` — specifically `qkv`, `out_proj`, `fc`, and `proj`. Add a global
+training progress tracker that flips QAT on at the right step.
 
-**Lines of code:** ~30
-**Expected recovery:** 0.01–0.02 of the 0.0325 gap (conservative estimate)
-**Runs to validate:** 3 (QAT at 80%, 70%, 60% of training)
+**What we validate:** Run 3 times with QAT activating at 60%, 70%, and 80% of training
+to find the sweet spot. Compare post-quantization BPB against baseline.
+
+**~30 lines of code.**
 
 ---
 
 ## Step 2: Find the Right Model Shape
 
-**The problem:** The baseline is 9 layers × 512 dim. Is that optimal for 16MB? Nobody
-checked. The 16MB budget creates a tradeoff: wider models have more capacity per layer
-but fewer layers. Deeper models compose better but each layer is weaker.
+**The problem:** The baseline uses 9 layers × 512 dim. Is that optimal for 16MB?
+The 16MB budget forces a tradeoff: wider models have more capacity per layer but
+fewer layers. Deeper models compose better but each layer is weaker.
 
-**What we try (no code changes — all env vars):**
+**What we do:** Run 6 architecture configs, all via environment variables (zero code
+changes). Each must fit under 16MB after int8+zlib compression:
 
-| Config | Layers | Dim | Heads | KV Heads | MLP | Est. Size |
-|--------|--------|-----|-------|----------|-----|-----------|
-| Baseline | 9 | 512 | 8 | 4 | 2× | 15.8 MB |
-| Wide | 7 | 640 | 8 | 4 | 2× | ~15.5 MB |
-| Deep | 12 | 448 | 8 | 4 | 2× | ~15.6 MB |
-| MQA-Wide | 8 | 576 | 8 | 1 | 2× | ~15.4 MB |
-| Big-MLP | 9 | 512 | 8 | 4 | 3× | ~15.9 MB |
-| Vocab-2k | 9 | 480 | 8 | 4 | 2× | ~15.7 MB |
+| Config | Layers | Dim | Heads | KV Heads | MLP | Why Try It |
+|--------|--------|-----|-------|----------|-----|------------|
+| Baseline | 9 | 512 | 8 | 4 | 2× | Control |
+| Wide | 7 | 640 | 8 | 4 | 2× | More capacity per layer |
+| Deep | 12 | 448 | 8 | 4 | 2× | More compositional depth |
+| MQA-Wide | 8 | 576 | 8 | 1 | 2× | Save KV params → reinvest in width |
+| Big-MLP | 9 | 512 | 8 | 4 | 3× | More feedforward capacity |
+| Vocab-2k | 9 | 480 | 8 | 4 | 2× | Fewer tokens/byte → faster training |
 
-MQA (multi-query attention, KV_HEADS=1) is the most interesting: it saves ~200K params
-on KV projections, which we reinvest into width or an extra layer.
+MQA (multi-query attention, KV_HEADS=1) is the most interesting — it saves ~200K
+params on KV projections that we reinvest into model width.
 
-**Lines of code:** 0 (env var changes only)
-**Runs to validate:** 6 configs × 1 run each = 6 runs
-**What we learn:** The shape that gives the lowest BPB before quantization
+**What we learn:** Which shape gives the lowest BPB. This becomes the foundation for
+everything else.
 
 ---
 
-## Step 3: Tune the Training Recipe
+## Step 3: Tune the Training Hyperparameters
 
-**The problem:** The baseline hyperparameters were hand-picked, not optimized. The Muon
-optimizer's learning rate and the warmdown schedule are the two biggest levers.
+**The problem:** The baseline hyperparameters were hand-picked, not optimized. The
+Muon optimizer's learning rate and the warmdown schedule are the two biggest levers.
 
-**What we sweep (env vars only):**
+**What we do:** Three sequential rounds of sweeps on the winning shape from Step 2.
+Each round uses the winner from the previous round:
 
-Round A — Learning rate (4 runs):
+**Round A — Learning rate:**
 ```
 MATRIX_LR ∈ {0.03, 0.05, 0.06, 0.08}   (baseline: 0.04)
 ```
+Pick the best. This is the single most impactful hyperparameter.
 
-Round B — Take best LR, sweep warmdown (3 runs):
+**Round B — Warmdown schedule:**
 ```
 WARMDOWN_ITERS ∈ {800, 1600, 2000}       (baseline: 1200)
 ```
+Controls how long the LR decays at the end. Longer warmdown = more time at peak LR.
 
-Round C — Take best LR+warmdown, sweep batch (3 runs):
+**Round C — Batch size and sequence length:**
 ```
 TRAIN_BATCH_TOKENS ∈ {262144, 786432}    (baseline: 524288)
 TRAIN_SEQ_LEN ∈ {2048}                   (baseline: 1024)
 ```
+Smaller batch = more gradient updates in 10 min. Longer sequences = better context.
 
-**Lines of code:** 0
-**Runs:** 10 (sequential, each informs the next)
 **Why sequential:** LR interacts with batch size. Sweeping them jointly wastes runs.
+Each round narrows the search space for the next.
 
 ---
 
 ## Step 4: Combine and Submit
 
-Take the best from each step:
+Take the winners from each step:
 1. Best model shape (Step 2)
 2. Best hyperparameters (Step 3)
-3. Add QAT (Step 1)
+3. QAT from Step 1 (tuned activation point)
 
-Run this combination **5 times with different seeds** to get the mean and std needed
-for statistical significance (p < 0.01).
+Run this final config **5 times with different seeds**. The competition requires
+statistical significance (p < 0.01), so 5 seeds are mandatory.
 
-**Runs:** 5 + 2 buffer for final tweaks = 7 runs
-
----
-
-## Total Execution: 26 Runs
-
-| Step | Runs | What | Code Changes |
-|------|------|------|-------------|
-| 1. QAT validation | 3 | Validate QAT at different activation points | ~30 lines |
-| 2. Shape search | 6 | Find optimal depth/width/heads for 16MB | 0 lines |
-| 3. HP tuning | 10 | LR → warmdown → batch size (sequential) | 0 lines |
-| 4. Final combo + seeds | 7 | Combine winners, prove significance | 0 lines |
-| **Total** | **26** | | **~30 lines** |
+If BPB ≤ 1.2194: package `submission.json`, `README.md`, `train.log`, and submit PR.
 
 ---
 
-## The Execution Order (Day-by-Day)
+## Execution Order
 
-### Day 1: Shape + QAT in parallel
-- **Morning:** Launch 6 shape-search runs (can run in parallel if you have the nodes,
-  or sequentially in 1 hour). While waiting, write the QAT code.
-- **Afternoon:** Run 3 QAT validation runs on baseline shape. Analyze shape results,
-  pick the winner.
+### Day 1: Shape search + write QAT code
+- Launch 6 shape-search runs (parallel if multi-node, or 1 hour sequential).
+- While runs execute, write and test the QAT code locally.
+- Analyze shape results. Pick the winning architecture.
+- Run 3 QAT validation runs on the winning shape.
 
-### Day 2: HP tuning on best shape
-- Run 10 HP sweeps sequentially on the winning shape (100 min of compute).
-- Each round uses the winner from the previous round.
+### Day 2: HP tuning
+- Run 10 HP sweeps sequentially on winning shape (~100 min of compute).
+- Round A (LR) → Round B (warmdown) → Round C (batch).
+- Each round takes the best from the previous.
 
 ### Day 3: Combine + submit
-- Apply QAT to the best shape + best HPs.
-- Run 5 seeds for reproducibility.
-- If BPB < 1.2194: submit.
-- If not: use remaining 112 runs of budget for deeper exploration (ALBERT weight
-  sharing, progressive training, vocab size changes).
+- Apply QAT to best shape + best HPs. Verify improvement.
+- Run 5 seeds for reproducibility stats.
+- If target met: submit. If not: explore fallback ideas below.
 
 ---
 
-## Why This Works (And Why Not Less Compute)
+## Fallback Ideas (If Target Not Met)
 
-**Why 26 runs minimum (~4.3 hours of 8xH100, ~$95):**
+If the three main changes don't reach 1.2194, these are the next things to try:
 
-The competition requires **5 reproducibility runs** just for the submission — that's
-non-negotiable (50 min of compute). The remaining 21 runs are the minimum to avoid
-flying blind:
+**ALBERT-style weight sharing:** Share transformer block weights across layers.
+E.g., 3 unique blocks repeated 4× = 12 effective layers at the parameter cost of 3.
+Freed params go toward a wider model (dim 768+). ~15 lines of code.
 
-- **Shape search can't be skipped.** The baseline shape was chosen arbitrarily.
-  A wrong shape wastes everything else. 6 runs × 10 min = 1 hour to find the right
-  foundation. Cutting this means gambling on the baseline shape being optimal.
+**Progressive training:** Train a smaller model fast for the first 6 minutes (more
+gradient steps), then expand to the full model via net2net-style weight copying for
+the final 4 minutes. ~60 lines of code.
 
-- **HP tuning can't be skipped.** Learning rate is the single most impactful
-  hyperparameter in deep learning. The wrong LR wastes the entire training budget.
-  10 sequential runs (100 min) finds the right ballpark. Cutting this means gambling
-  on the baseline LR being optimal for a different architecture.
+**Data curriculum:** Order training shards by difficulty (easy → hard). Score shards
+by average loss from a baseline run, then train in ascending order. ~20 lines of code.
 
-- **QAT validation can't be skipped.** If QAT hurts instead of helps (wrong activation
-  point, too aggressive), we need to know before combining. 3 runs (30 min) to validate
-  the core thesis.
+---
 
-**Why we keep $400 in reserve:**
+## Summary
 
-The 26-run plan is the *minimum viable submission*. If any step produces surprising
-results (e.g., the wide model is way better, suggesting even wider might work), the
-reserve lets us dig deeper. The reserve also covers:
-- ALBERT weight sharing (if shape search shows depth matters more than width)
-- Progressive training (if we're step-count limited, not parameter limited)
-- Vocab size experiments (requires retokenization — expensive to get wrong)
-- Second-order HP interactions we missed
+| Step | What We Do | Code Changes |
+|------|-----------|-------------|
+| 1. QAT | Add fake int8 quantization with STE in last 20% of training | ~30 lines |
+| 2. Shape | Try 6 architecture configs via env vars | 0 lines |
+| 3. HPs | Sweep LR → warmdown → batch size sequentially | 0 lines |
+| 4. Submit | Combine winners, run 5 seeds, submit PR | 0 lines |
 
-**The $500 isn't "needed" — $95 is needed. The rest is insurance against surprises.**
+**Core thesis:** The quantization gap (0.0325 BPB) is the single biggest opportunity.
+QAT addresses it directly. Shape and HP tuning squeeze out the rest. Combined, these
+three orthogonal improvements should clear the 0.005 BPB bar with margin to spare.
